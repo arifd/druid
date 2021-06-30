@@ -22,10 +22,13 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Error};
-use x11rb::connection::Connection;
+use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::present::ConnectionExt as _;
+use x11rb::protocol::render::{self, ConnectionExt as _, Pictformat};
 use x11rb::protocol::xfixes::ConnectionExt as _;
-use x11rb::protocol::xproto::{self, ConnectionExt, CreateWindowAux, EventMask, WindowClass};
+use x11rb::protocol::xproto::{
+    self, ConnectionExt, CreateWindowAux, EventMask, Visualtype, WindowClass,
+};
 use x11rb::protocol::Event;
 use x11rb::resource_manager::Database as ResourceDb;
 use x11rb::xcb_ffi::XCBConnection;
@@ -50,6 +53,11 @@ pub(crate) struct Application {
     /// Let's just avoid the issue altogether. As far as public API is concerned, this causes
     /// `druid_shell::WindowHandle` to be `!Send` and `!Sync`.
     marker: std::marker::PhantomData<*mut XCBConnection>,
+
+    /// The type of visual used by the root window
+    root_visual_type: Visualtype,
+    /// The visual for windows with transparent backgrounds, if supported
+    argb_visual_type: Option<Visualtype>,
 
     /// The X11 resource database used to query dpi.
     pub(crate) rdb: Rc<ResourceDb>,
@@ -83,6 +91,8 @@ pub(crate) struct Application {
     idle_write: RawFd,
     /// The major opcode of the Present extension, if it is supported.
     present_opcode: Option<u8>,
+    /// Support for the render extension in at least version 0.5?
+    render_argb32_pictformat_cursor: Option<Pictformat>,
 }
 
 /// The mutable `Application` state.
@@ -138,6 +148,36 @@ impl Application {
             }
         };
 
+        let pictformats = connection.render_query_pict_formats()?;
+        let render_create_cursor_supported = matches!(connection
+            .extension_information(render::X11_EXTENSION_NAME)?
+            .and_then(|_| connection.render_query_version(0, 5).ok())
+            .map(|cookie| cookie.reply())
+            .transpose()?,
+            Some(version) if version.major_version >= 1 || version.minor_version >= 5);
+        let render_argb32_pictformat_cursor = if render_create_cursor_supported {
+            pictformats
+                .reply()?
+                .formats
+                .iter()
+                .find(|format| {
+                    format.type_ == render::PictType::DIRECT
+                        && format.depth == 32
+                        && format.direct.red_shift == 16
+                        && format.direct.red_mask == 0xff
+                        && format.direct.green_shift == 8
+                        && format.direct.green_mask == 0xff
+                        && format.direct.blue_shift == 0
+                        && format.direct.blue_mask == 0xff
+                        && format.direct.alpha_shift == 24
+                        && format.direct.alpha_mask == 0xff
+                })
+                .map(|format| format.id)
+        } else {
+            drop(pictformats);
+            None
+        };
+
         let handle = x11rb::cursor::Handle::new(connection.as_ref(), screen_num, &rdb)?.reply()?;
         let load_cursor = |cursor| {
             handle
@@ -156,6 +196,15 @@ impl Application {
             col_resize: load_cursor("col-resize"),
         };
 
+        let screen = connection
+            .setup()
+            .roots
+            .get(screen_num as usize)
+            .ok_or_else(|| anyhow!("Invalid screen num: {}", screen_num))?;
+        let root_visual_type = util::get_visual_from_screen(&screen)
+            .ok_or_else(|| anyhow!("Couldn't get visual from screen"))?;
+        let argb_visual_type = util::get_argb_visual_type(&*connection, &screen)?;
+
         Ok(Application {
             connection,
             rdb,
@@ -166,7 +215,10 @@ impl Application {
             cursors,
             idle_write,
             present_opcode,
+            root_visual_type,
+            argb_visual_type,
             marker: std::marker::PhantomData,
+            render_argb32_pictformat_cursor,
         })
     }
 
@@ -215,6 +267,12 @@ impl Application {
     #[inline]
     pub(crate) fn present_opcode(&self) -> Option<u8> {
         self.present_opcode
+    }
+
+    /// Return the ARGB32 pictformat of the server, but only if RENDER's CreateCursor is supported
+    #[inline]
+    pub(crate) fn render_argb32_pictformat_cursor(&self) -> Option<Pictformat> {
+        self.render_argb32_pictformat_cursor
     }
 
     fn create_event_window(conn: &Rc<XCBConnection>, screen_num: i32) -> Result<u32, Error> {
@@ -284,6 +342,33 @@ impl Application {
     #[inline]
     pub(crate) fn screen_num(&self) -> i32 {
         self.screen_num
+    }
+
+    #[inline]
+    pub(crate) fn argb_visual_type(&self) -> Option<Visualtype> {
+        // Check if a composite manager is running
+        let atom_name = format!("_NET_WM_CM_S{}", self.screen_num);
+        let owner = self
+            .connection
+            .intern_atom(false, atom_name.as_bytes())
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.atom)
+            .and_then(|atom| self.connection.get_selection_owner(atom).ok())
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| reply.owner);
+
+        if Some(x11rb::NONE) == owner {
+            tracing::debug!("_NET_WM_CM_Sn selection is unowned, not providing ARGB visual");
+            None
+        } else {
+            self.argb_visual_type
+        }
+    }
+
+    #[inline]
+    pub(crate) fn root_visual_type(&self) -> Visualtype {
+        self.root_visual_type
     }
 
     /// Returns `Ok(true)` if we want to exit the main loop.
